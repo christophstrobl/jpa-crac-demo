@@ -1,11 +1,21 @@
 package com.example.crac.jpacracdemo;
 
 import javax.sql.DataSource;
+import java.io.IOException;
 import java.io.PrintWriter;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketImpl;
+import java.net.SocketImplFactory;
 import java.sql.Connection;
 import java.sql.ConnectionBuilder;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -22,17 +32,26 @@ import com.zaxxer.hikari.HikariPoolMXBean;
 import com.zaxxer.hikari.metrics.MetricsTrackerFactory;
 import com.zaxxer.hikari.pool.HikariPool;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.DirectFieldAccessor;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.context.annotation.Bean;
+import org.springframework.util.ReflectionUtils;
 
 @SpringBootApplication
 public class JpaCracDemoApplication {
 
-	public static void main(String[] args) {
+	static volatile List<SocketImpl> allSockets = Collections.synchronizedList(new ArrayList<SocketImpl>());
+
+	public static void main(String[] args) throws IOException {
+
+		SpySocketImplFactory spySocketImplFactory = new SpySocketImplFactory(allSockets);
+		Socket.setSocketImplFactory(spySocketImplFactory);
+		ServerSocket.setSocketFactory(spySocketImplFactory);
+
 		SpringApplication.run(JpaCracDemoApplication.class, args);
 	}
 
@@ -49,6 +68,36 @@ public class JpaCracDemoApplication {
 		return new MyDataSource((HikariDataSource) properties.initializeDataSourceBuilder().type(type).build());
 	}
 
+	private static SocketImpl newSocketImpl() {
+		try {
+			Class<?> defaultSocketImpl = Class.forName("java.net.SocksSocketImpl");
+			Constructor<?> constructor = defaultSocketImpl.getDeclaredConstructor(SocketImpl.class);
+			constructor.setAccessible(true);
+			Method m = ReflectionUtils.findMethod(SocketImpl.class, "createPlatformSocketImpl", boolean.class);
+			m.setAccessible(true);
+			Object o = ReflectionUtils.invokeMethod(m, null, false);
+			return (SocketImpl) constructor.newInstance(o);
+		} catch (Exception e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	private static class SpySocketImplFactory implements SocketImplFactory {
+
+		private final List<SocketImpl> spy;
+
+		public SpySocketImplFactory(List<SocketImpl> spy) {
+			this.spy = spy;
+		}
+
+		@Override
+		public SocketImpl createSocketImpl() {
+			SocketImpl socket = newSocketImpl();
+			spy.add(socket);
+			return socket;
+		}
+	}
+
 	static class MyDataSource extends HikariDataSource implements DataSource, SmartLifecycle {
 
 		org.slf4j.Logger logger = LoggerFactory.getLogger(MyDataSource.class);
@@ -60,16 +109,16 @@ public class JpaCracDemoApplication {
 
 			if (delegate.getHikariPoolMXBean() instanceof HikariPool pool) {
 				if (pool.poolState == HikariPool.POOL_NORMAL) {
-					logger.info("hikariCP pool already started - nothing to to");
+					logger.info("hikariCP pool %s already started - nothing to to".formatted(delegate.getPoolName()));
 				} else if (pool.poolState == HikariPool.POOL_SHUTDOWN) {
-					logger.info("hikariCP pool closed - restarting");
+					logger.info("hikariCP pool %s closed - restarting".formatted(delegate.getPoolName()));
 					delegate = new HikariDataSource(delegate);
 				} else if (pool.poolState == HikariPool.POOL_SUSPENDED) {
-					logger.info("hikariCP pool suspended - resuming");
+					logger.info("hikariCP pool %s suspended - resuming".formatted(delegate.getPoolName()));
 					pool.resumePool();
 				}
 			} else {
-				logger.info("hikariCP pool not found - initializing new");
+				logger.info("hikariCP pool %s not found - initializing new".formatted(delegate.getPoolName()));
 				delegate = new HikariDataSource(delegate);
 			}
 		}
@@ -77,12 +126,17 @@ public class JpaCracDemoApplication {
 		@Override
 		public void stop() {
 
+			System.out.println("Sockets open before closing pool");
+			for (SocketImpl impl : allSockets) {
+				System.out.println("%s: %s".formatted(impl, getState(impl)));
+			}
+
 			if (delegate.getHikariPoolMXBean() instanceof HikariPool pool) {
 				if (delegate.isAllowPoolSuspension()) {
 
-					logger.info("suspending HikariPool");
+					logger.info("suspending HikariPool %s".formatted(delegate.getPoolName()));
 					pool.suspendPool();
-					logger.info("evicting HikariPool connections");
+					logger.info("evicting HikariPool %s connections".formatted(delegate.getPoolName()));
 					pool.softEvictConnections();
 
 					CompletableFuture<Void> awaitClosure = CompletableFuture.runAsync(() -> waitForConnectionClosure(pool));
@@ -93,29 +147,56 @@ public class JpaCracDemoApplication {
 					}
 
 					if (pool.getTotalConnections() > 0) {
-						logger.info("suspending HikariPool failed - closing HikariDataSource");
+						logger.info("suspending HikariPool %s failed - closing HikariDataSource".formatted(delegate.getPoolName()));
 						delegate.close();
+					}
+
+					System.out.println("Sockets after closing pool");
+					for (SocketImpl impl : allSockets) {
+						System.out.println("%s: %s".formatted(impl, getState(impl)));
 					}
 					return;
 				}
 				if (pool.poolState == HikariPool.POOL_NORMAL) {
-					logger.info("PoolSuspension not allowed - closing HikariDataSource");
+					logger.info("%s PoolSuspension not allowed - closing HikariDataSource".formatted(delegate.getPoolName()));
 					delegate.close();
 				}
 			} else {
-				logger.info("Not a HikariPool - closing HikariDataSource");
+				logger.info("%s is not a HikariPool - closing HikariDataSource".formatted(delegate.getPoolName()));
 				delegate.close();
 			}
+		}
+
+		private static Object getState(SocketImpl impl) {
+			try {
+
+				Object delegate1 = new DirectFieldAccessor(impl).getPropertyValue("delegate");
+				Object state = new DirectFieldAccessor(delegate1).getPropertyValue("state");
+				if (state instanceof Integer i) {
+					return switch (i) {
+						case 0 -> "new";
+						case 1 -> "unconnected";
+						case 2 -> "connecting";
+						case 3 -> "connected";
+						case 4 -> "closing";
+						case 5 -> "closed";
+						default -> throw new IllegalStateException("Unexpected value: " + i);
+					};
+				}
+			} catch (Exception e) {
+				throw new RuntimeException(e);
+			}
+			return null;
 		}
 
 		private void waitForConnectionClosure(HikariPool pool) {
 
 			logger.info("""
-					HikariPool connections:
+					HikariPool %s connections:
 						total: %s
 						active: %s
 						idle: %s
-					""".formatted(pool.getTotalConnections(), pool.getActiveConnections(), pool.getIdleConnections()));
+					""".formatted(delegate.getPoolName(), pool.getTotalConnections(), pool.getActiveConnections(), pool.getIdleConnections()));
 			while (pool.getTotalConnections() > 0) {
 				try {
 					TimeUnit.MILLISECONDS.sleep(500);
@@ -130,7 +211,7 @@ public class JpaCracDemoApplication {
 		public boolean isRunning() {
 
 			if (delegate.getHikariPoolMXBean() instanceof HikariPool pool) {
-				logger.info("HikariPool: " + poolState(pool.poolState));
+				logger.info("HikariPool %s: %s".formatted(delegate.getPoolName(), poolState(pool.poolState)));
 				return pool.poolState == HikariPool.POOL_NORMAL;
 			}
 			return true;

@@ -21,7 +21,7 @@ docker build -t my_jpa_app_on_crac .
 docker run -it --privileged --rm --name my_jpa_app_on_crac \
     -v $PWD/crac-files:/opt/crac-files my_jpa_app_on_crac \
     bash -c "echo 128 > /proc/sys/kernel/ns_last_pid;
-    java -XX:CRaCCheckpointTo=/opt/crac-files -jar /opt/app/jpa-crac-demo-0.0.1-SNAPSHOT.jar"
+    java --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -XX:CRaCCheckpointTo=/opt/crac-files -XX:CRaCCheckpointTo=/opt/crac-files -jar /opt/app/jpa-crac-demo-0.0.1-SNAPSHOT.jar"
     
 docker exec my_jpa_app_on_crac jcmd 129 JDK.checkpoint    
 ```
