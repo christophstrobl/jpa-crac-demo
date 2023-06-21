@@ -7,8 +7,12 @@ import java.sql.ConnectionBuilder;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Logger;
 
 import com.zaxxer.hikari.HikariConfig;
@@ -50,6 +54,96 @@ public class JpaCracDemoApplication {
 		org.slf4j.Logger logger = LoggerFactory.getLogger(MyDataSource.class);
 
 		HikariDataSource delegate;
+
+		@Override
+		public void start() {
+
+			if (delegate.getHikariPoolMXBean() instanceof HikariPool pool) {
+				if (pool.poolState == HikariPool.POOL_NORMAL) {
+					logger.info("hikariCP pool already started - nothing to to");
+				} else if (pool.poolState == HikariPool.POOL_SHUTDOWN) {
+					logger.info("hikariCP pool closed - restarting");
+					delegate = new HikariDataSource(delegate);
+				} else if (pool.poolState == HikariPool.POOL_SUSPENDED) {
+					logger.info("hikariCP pool suspended - resuming");
+					pool.resumePool();
+				}
+			} else {
+				logger.info("hikariCP pool not found - initializing new");
+				delegate = new HikariDataSource(delegate);
+			}
+		}
+
+		@Override
+		public void stop() {
+
+			if (delegate.getHikariPoolMXBean() instanceof HikariPool pool) {
+				if (delegate.isAllowPoolSuspension()) {
+
+					logger.info("suspending HikariPool");
+					pool.suspendPool();
+					logger.info("evicting HikariPool connections");
+					pool.softEvictConnections();
+
+					CompletableFuture<Void> awaitClosure = CompletableFuture.runAsync(() -> waitForConnectionClosure(pool));
+					try {
+						awaitClosure.get(delegate.getIdleTimeout() + 1000, TimeUnit.MILLISECONDS);
+					} catch (InterruptedException | ExecutionException | TimeoutException e) {
+						throw new RuntimeException(e);
+					}
+
+					if (pool.getTotalConnections() > 0) {
+						logger.info("suspending HikariPool failed - closing HikariDataSource");
+						delegate.close();
+					}
+					return;
+				}
+				if (pool.poolState == HikariPool.POOL_NORMAL) {
+					logger.info("PoolSuspension not allowed - closing HikariDataSource");
+					delegate.close();
+				}
+			} else {
+				logger.info("Not a HikariPool - closing HikariDataSource");
+				delegate.close();
+			}
+		}
+
+		private void waitForConnectionClosure(HikariPool pool) {
+
+			logger.info("""
+					HikariPool connections:
+						total: %s
+						active: %s
+						idle: %s
+					""".formatted(pool.getTotalConnections(), pool.getActiveConnections(), pool.getIdleConnections()));
+			while (pool.getTotalConnections() > 0) {
+				try {
+					TimeUnit.MILLISECONDS.sleep(500);
+				} catch (InterruptedException e) {
+					logger.error("Interrupted while waiting for connections to be closed", e);
+					Thread.currentThread().interrupt();
+				}
+			}
+		}
+
+		@Override
+		public boolean isRunning() {
+
+			if (delegate.getHikariPoolMXBean() instanceof HikariPool pool) {
+				logger.info("HikariPool: " + poolState(pool.poolState));
+				return pool.poolState == HikariPool.POOL_NORMAL;
+			}
+			return true;
+		}
+
+		String poolState(int value) {
+			return switch (value) {
+				case HikariPool.POOL_NORMAL -> "running";
+				case HikariPool.POOL_SHUTDOWN -> "closed";
+				case HikariPool.POOL_SUSPENDED -> "suspended";
+				default -> throw new IllegalStateException("Unexpected value: " + value);
+			};
+		}
 
 		public MyDataSource(HikariDataSource delegate) {
 			this.delegate = delegate;
@@ -413,37 +507,6 @@ public class JpaCracDemoApplication {
 
 		@Override
 		public boolean isAutoStartup() {
-			return true;
-		}
-
-		@Override
-		public void start() {
-			if (delegate.getHikariPoolMXBean() instanceof HikariPool pool) {
-				if (pool.poolState == HikariPool.POOL_SUSPENDED) {
-					logger.info("hikari resume pool");
-					pool.resumePool();
-				}
-			}
-		}
-
-		@Override
-		public void stop() {
-			if (delegate.getHikariPoolMXBean() instanceof HikariPool pool) {
-				if (pool.poolState == HikariPool.POOL_NORMAL) {
-					logger.info("hikari suspend pool");
-					pool.softEvictConnections();
-					pool.suspendPool();
-				}
-			}
-		}
-
-		@Override
-		public boolean isRunning() {
-
-			if (delegate.getHikariPoolMXBean() instanceof HikariPool pool) {
-				logger.info("hikari pool state: " + pool.poolState);
-				return pool.poolState == 0;
-			}
 			return true;
 		}
 

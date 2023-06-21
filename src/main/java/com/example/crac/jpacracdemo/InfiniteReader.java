@@ -46,14 +46,9 @@ public class InfiniteReader implements CommandLineRunner, SmartLifecycle {
 	@Override
 	public void run(String... args) throws Exception {
 
-		DefaultLifecycleProcessor processor = new DefaultLifecycleProcessor();
-		processor.setBeanFactory(((AnnotationConfigApplicationContext) ctx).getBeanFactory());
-		processor.stop();
-
-
-		if(!isRunning()) {
-			run.set(true);
-		}
+//		DefaultLifecycleProcessor processor = new DefaultLifecycleProcessor();
+//		processor.setBeanFactory(((AnnotationConfigApplicationContext) ctx).getBeanFactory());
+//		processor.stop();
 
 		while (isRunning()) {
 			System.out.println(repository.findAll());
@@ -63,12 +58,20 @@ public class InfiniteReader implements CommandLineRunner, SmartLifecycle {
 
 	@Override
 	public void start() {
+
 		try {
+
 			Person person = new Person();
 			person.id = "id-1";
 			person.name = "me";
 			repository.save(person);
-			run();
+
+			System.out.println("saved: " + person);
+
+			if(!isRunning()) {
+				run.set(true);
+			}
+
 		} catch (Exception e) {
 			throw new RuntimeException(e);
 		}
